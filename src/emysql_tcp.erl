@@ -138,6 +138,7 @@ response(Sock, DefaultTimeout, #packet{seq_num = SeqNum, data = Data}=_Packet, B
     %-% io:format("~nresponse (DATA): ~p~n", [_Packet]),
     {FieldCount, Rest1} = emysql_util:length_coded_binary(Data),
     {Extra, _} = emysql_util:length_coded_binary(Rest1),
+
     {SeqNum1, FieldList, Buff2} = recv_field_list(Sock, SeqNum+1, DefaultTimeout, Buff),
     if
         length(FieldList) =/= FieldCount ->
@@ -145,40 +146,27 @@ response(Sock, DefaultTimeout, #packet{seq_num = SeqNum, data = Data}=_Packet, B
         true ->
             ok
     end,
-    {SeqNum2, Rows, ServerStatus, Buff3} = recv_row_data(Sock, FieldList, DefaultTimeout, SeqNum1+1, Buff2),
+    FieldList2 = [Field#field.type || Field <- FieldList],
+    {SeqNum2, Rows, ServerStatus, Buff3} = recv_row_data(Sock, FieldList2, DefaultTimeout, SeqNum1+1, Buff2),
+
     { #result_packet{
         seq_num = SeqNum2,
         field_list = FieldList,
-        rows = Rows,
+        rows = lists:reverse(Rows),
         extra = Extra },
       ServerStatus, Buff3 }.
 
 recv_packet_header(_Sock, _Timeout, <<PacketLength:24/little-integer, SeqNum:8/integer, Rest/binary>>) ->
         {PacketLength, SeqNum, Rest};
 recv_packet_header(Sock, Timeout, Buff) when erlang:byte_size(Buff) < 4 ->
-        case gen_tcp:recv(Sock, 0, Timeout) of
-            {ok, Data} ->
-                recv_packet_header(Sock, Timeout, <<Buff/binary, Data/binary>>);
-            {error, Reason} ->
-                exit({failed_to_recv_packet_header, Reason})
-        end;
+    case gen_tcp:recv(Sock, 0, Timeout) of
+        {ok, Data} ->
+            recv_packet_header(Sock, Timeout, <<Buff/binary, Data/binary>>);
+        {error, Reason} ->
+            exit({failed_to_recv_packet_header, Reason})
+    end;
 recv_packet_header(_Sock, _Timeout, Buff) ->
-        exit({bad_packet_header_data, Buff}).
-    
-
-% This was used to approach a solution for proper handling of SERVER_MORE_RESULTS_EXIST
-%
-% recv_packet_header_if_present(Sock) ->
-%   case gen_tcp:recv(Sock, 4, 0) of
-%       {ok, <<PacketLength:24/little-integer, SeqNum:8/integer>>} ->
-%           {PacketLength, SeqNum};
-%       {ok, Bin} when is_binary(Bin) ->
-%           exit({bad_packet_header_data, Bin});
-%       {error, timeout} ->
-%           none;
-%       {error, Reason} ->
-%           exit({failed_to_recv_packet_header, Reason})
-%   end.
+    exit({bad_packet_header_data, Buff}).
 
 recv_packet_body(Sock, PacketLength, Timeout, Buff) ->
     case Buff of
@@ -196,182 +184,74 @@ recv_packet_body(Sock, PacketLength, Timeout, Buff) ->
 recv_field_list(Sock, SeqNum, DefaultTimeout, Buff) ->
     recv_field_list(Sock, SeqNum, DefaultTimeout,[], Buff).
 
-recv_field_list(Sock, _SeqNum, DefaultTimeout, Acc, Buff) ->
-	case recv_packet(Sock, DefaultTimeout, Buff) of
-        {#packet{seq_num = SeqNum1, data = <<?RESP_EOF, _WarningCount:16/little, _ServerStatus:16/little>>}, Unparsed} -> % (*)!
-			%-% io:format("- eof: ~p~n", [emysql_conn:hstate(_ServerStatus)]),
-                        {SeqNum1, lists:reverse(Acc), Unparsed};
-        {#packet{seq_num = SeqNum1, data = <<?RESP_EOF, _/binary>>}, Unparsed} ->
-			%-% io:format("- eof~n", []),
-                        {SeqNum1, lists:reverse(Acc), Unparsed};
-        {#packet{seq_num = SeqNum1, data = Data}, Unparsed} ->
-			{Catalog, Rest2} = emysql_util:length_coded_string(Data),
-			{Db, Rest3} = emysql_util:length_coded_string(Rest2),
-			{Table, Rest4} = emysql_util:length_coded_string(Rest3),
-			{OrgTable, Rest5} = emysql_util:length_coded_string(Rest4),
-			{Name, Rest6} = emysql_util:length_coded_string(Rest5),
-			{OrgName, Rest7} = emysql_util:length_coded_string(Rest6),
-			<<_:1/binary, CharSetNr:16/little, Length:32/little, Rest8/binary>> = Rest7,
-			<<Type:8/little, Flags:16/little, Decimals:8/little, _:2/binary, Rest9/binary>> = Rest8,
-			{Default, _} = emysql_util:length_coded_binary(Rest9),
-			Field = #field{
-				seq_num = SeqNum1,
-				catalog = Catalog,
-				db = Db,
-				table = Table,
-				org_table = OrgTable,
-				name = Name,
-				org_name = OrgName,
-				type = Type,
-				default = Default,
-				charset_nr = CharSetNr,
-				length = Length,
-				flags = Flags,
-				decimals = Decimals,
-                decoder = cast_fun_for(Type)
-			},
-			recv_field_list(Sock, SeqNum1, DefaultTimeout, [Field|Acc], Unparsed)
-	end.
+recv_field_list(Sock, _SeqNum, DefaultTimeout, _Acc, Buff) ->
+    {SeqNum, Columns, _ServerStatus, Buff2} = recv_row_data(Sock, [
+        ?FIELD_TYPE_VAR_STRING, 
+        ?FIELD_TYPE_VAR_STRING,
+        ?FIELD_TYPE_VAR_STRING, 
+        ?FIELD_TYPE_VAR_STRING, 
+        ?FIELD_TYPE_VAR_STRING, 
+        ?FIELD_TYPE_VAR_STRING,
+        ?FIELD_TYPE_FIELD_EXTRA
+    ], DefaultTimeout, 0, Buff),
+    {SeqNum, get_field_list(Columns, SeqNum), Buff2}.
 
+get_field_list(Columns, Seqnum) ->
+    get_field_list(Columns, Seqnum, []).
+
+get_field_list([[Catalog, Db, Table, OrgTable, Name, OrgName, {CharSetNr, Length, Type, Flags, Decimals, Default}] | Rest], Seqnum, Acc) ->
+    get_field_list(Rest, Seqnum - 1,[
+        #field{
+            seq_num = Seqnum - 1, 
+            catalog = Catalog, 
+            db = Db, 
+            table = Table, 
+            org_table = OrgTable, 
+            name = Name, 
+            org_name = OrgName, 
+            type = Type, 
+            default = case Default of undefined -> <<>>; _ -> Default end, 
+            charset_nr = CharSetNr, 
+            length = Length, 
+            flags = Flags, 
+            decimals = Decimals
+        } | Acc]);
+get_field_list([], _Seqnum, Acc) ->
+    Acc.
+           
 
 recv_row_data(Socket, FieldList, DefaultTimeout, SeqNum, Buff) ->
     recv_row_data(Socket, FieldList, DefaultTimeout, SeqNum, Buff, []).
 
 recv_row_data(Socket, FieldList, Timeout, SeqNum, Buff, Acc) ->
-       case parse_buffer(FieldList,Buff, Acc) of
-                {ok, NotParsed, NewAcc} ->
-                    case gen_tcp:recv(Socket, 0, Timeout) of
-                        {ok, Data} ->
-                            recv_row_data(Socket, FieldList, Timeout, SeqNum+1,  <<NotParsed/binary, Data/binary>>, NewAcc);
-                        {error, Reason} ->
-                            exit({failed_to_recv_row, Reason})
-                    end;
-                {eof, Seq, NewAcc, ServerStatus, NotParsed} ->
-                    {Seq, lists:reverse(NewAcc), ServerStatus, NotParsed}
-        end.
-
-parse_buffer(FieldList,<<PacketLength:24/little-integer, SeqNum:8/integer, PacketData:PacketLength/binary, Rest/binary>>, Acc) ->
-    case PacketData of
-        <<?RESP_EOF, _WarningCount:16/little, ServerStatus:16/little>> ->
-            {eof, SeqNum, Acc, ServerStatus, Rest};
-        <<?RESP_EOF, _/binary>> ->
-            {eof, SeqNum, Acc, ?SERVER_NO_STATUS, Rest};
-        _ ->
-            Row = decode_row_data(PacketData, FieldList),
-            parse_buffer(FieldList,Rest, [Row|Acc])
-    end;
-parse_buffer(_FieldList,Buff, Acc) ->
-    {ok, Buff, Acc}.
-
-decode_row_data(<<>>, []) ->
-    [];
-decode_row_data(<<Length:8, Data:Length/binary, Tail/binary>>, [Field|Rest]) 
-        when Length =< 250 ->
-    [type_cast_row_data(Data, Field) | decode_row_data(Tail, Rest)];
-%% 251 means null
-decode_row_data(<<251:8, Tail/binary>>, [Field|Rest]) ->  
-    [type_cast_row_data(undefined, Field) | decode_row_data(Tail, Rest)];
-decode_row_data(<<252:8, Length:16/little, Data:Length/binary, Tail/binary>>, [Field|Rest]) ->
-    [type_cast_row_data(Data, Field) | decode_row_data(Tail, Rest)];
-decode_row_data(<<253:8, Length:24/little, Data:Length/binary, Tail/binary>>, [Field|Rest]) ->
-    [type_cast_row_data(Data, Field) | decode_row_data(Tail, Rest)];
-decode_row_data(<<254:8, Length:64/little, Data:Length/binary, Tail/binary>>, [Field|Rest]) ->
-    [type_cast_row_data(Data, Field) | decode_row_data(Tail, Rest)].
-
-%decode_row_data(Bin, [Field|Rest], Acc) ->
-%    {Data, Tail} = emysql_util:length_coded_string(Bin),
-%    decode_row_data(Tail, Rest, [type_cast_row_data(Data, Field)|Acc]).
-
-cast_fun_for(Type) ->
-    Map = [{?FIELD_TYPE_VARCHAR, fun identity/1},
-     {?FIELD_TYPE_TINY_BLOB, fun identity/1},
-     {?FIELD_TYPE_MEDIUM_BLOB, fun identity/1},
-     {?FIELD_TYPE_LONG_BLOB, fun identity/1},
-     {?FIELD_TYPE_BLOB, fun identity/1},
-     {?FIELD_TYPE_VAR_STRING, fun identity/1},
-     {?FIELD_TYPE_STRING, fun identity/1},
-     {?FIELD_TYPE_TINY, fun to_integer/1},
-     {?FIELD_TYPE_SHORT, fun to_integer/1},
-     {?FIELD_TYPE_LONG, fun to_integer/1},
-     {?FIELD_TYPE_LONGLONG, fun to_integer/1},
-     {?FIELD_TYPE_INT24, fun to_integer/1},
-     {?FIELD_TYPE_YEAR, fun to_integer/1},
-     {?FIELD_TYPE_DECIMAL, fun to_float/1},
-     {?FIELD_TYPE_NEWDECIMAL, fun to_float/1},
-     {?FIELD_TYPE_FLOAT, fun to_float/1},
-     {?FIELD_TYPE_DOUBLE, fun to_float/1},
-     {?FIELD_TYPE_DATE, fun to_date/1},
-     {?FIELD_TYPE_TIME, fun to_time/1},
-     {?FIELD_TYPE_TIMESTAMP, fun to_timestamp/1},
-     {?FIELD_TYPE_DATETIME, fun to_timestamp/1},
-     {?FIELD_TYPE_BIT, fun to_bit/1}
-    ],
-% TODO:
-% ?FIELD_TYPE_NEWDATE
-% ?FIELD_TYPE_ENUM
-% ?FIELD_TYPE_SET
-% ?FIELD_TYPE_GEOMETRY
-    case lists:keyfind(Type, 1, Map) of
-        false ->
-            fun identity/1;
-        {Type, F} ->
-            F
+    case parse_buffer(FieldList,Buff, Acc) of
+            {ok, NotParsed, NewAcc} ->
+                case gen_tcp:recv(Socket, 0, Timeout) of
+                    {ok, Data} ->
+                        recv_row_data(Socket, FieldList, Timeout, SeqNum+1,  <<NotParsed/binary, Data/binary>>, NewAcc);
+                    {error, Reason} ->
+                        exit({failed_to_recv_row, Reason})
+                end;
+            {eof, Seq, NewAcc, ServerStatus, NotParsed} ->
+                {Seq, NewAcc, ServerStatus, NotParsed}
     end.
 
-identity(Data) -> Data.
--ifdef(binary_to_integer).
-to_integer(Data) -> binary_to_integer(Data).
--else.
-to_integer(Data) -> list_to_integer(binary_to_list(Data)).
--endif.
-
-to_float(Data) ->
-    {ok, [Num], _Leftovers} = case io_lib:fread("~f", binary_to_list(Data)) of
-                                           % note: does not need conversion
-        {error, _} ->
-          case io_lib:fread("~d", binary_to_list(Data)) of  % note: does not need conversion
-            {ok, [_], []} = Res ->
-              Res;
-            {ok, [X], E} ->
-              io_lib:fread("~f", lists:flatten(io_lib:format("~w~s~s" ,[X,".0",E])))
-          end
-        ;
-        Res ->
-          Res
-    end,
-    Num.
-to_date(Data) ->
-    case io_lib:fread("~d-~d-~d", binary_to_list(Data)) of  % note: does not need conversion
-        {ok, [Year, Month, Day], _} ->
-            {date, {Year, Month, Day}};
-        {error, _} ->
-            binary_to_list(Data);  % todo: test and possibly conversion to UTF-8
-        _ ->
-            exit({error, bad_date})
+parse_buffer(FieldList, Buff, Acc) ->
+    case emysql_parse:parse_buffer(Buff, FieldList, Acc) of
+        {eof, ServerStatus, SeqNum, Acc2, Rest} ->
+            {eof, SeqNum, Acc2, ServerStatus, Rest};
+        {eof, SeqNum, Acc2, Rest} ->
+            {eof, SeqNum, Acc2, ?SERVER_NO_STATUS, Rest};
+        {incomplete, Acc2, Rest} ->
+            case Rest of
+                empty ->
+                    {ok, <<"">>, Acc2};
+                _     ->
+                    {ok, Rest, Acc2}
+            end;
+        A ->
+            io:format("~w~n",[A])
     end.
-to_time(Data) ->
-    case io_lib:fread("~d:~d:~d", binary_to_list(Data)) of  % note: does not need conversion
-        {ok, [Hour, Minute, Second], _} ->
-            {time, {Hour, Minute, Second}};
-        {error, _} ->
-            binary_to_list(Data);  % todo: test and possibly conversion to UTF-8
-        _ ->
-            exit({error, bad_time})
-    end.
-to_timestamp(Data) ->
-    case io_lib:fread("~d-~d-~d ~d:~d:~d", binary_to_list(Data)) of % note: does not need conversion
-        {ok, [Year, Month, Day, Hour, Minute, Second], _} ->
-            {datetime, {{Year, Month, Day}, {Hour, Minute, Second}}};
-        {error, _} ->
-            binary_to_list(Data);   % todo: test and possibly conversion to UTF-8
-        _ ->
-            exit({error, datetime})
-    end.
-to_bit(<<1>>) -> 1;  %%TODO: is this right?.  Shouldn't be <<"1">> ?
-to_bit(<<0>>) -> 0.
-
-type_cast_row_data(undefined, _) -> undefined;
-type_cast_row_data(Data, #field{decoder = F}) -> F(Data).
 
 
 

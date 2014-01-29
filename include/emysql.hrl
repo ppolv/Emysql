@@ -98,6 +98,7 @@
 -define(FIELD_TYPE_NEWDATE, 16#0e).
 -define(FIELD_TYPE_VARCHAR, 16#0f).
 -define(FIELD_TYPE_BIT, 16#10).
+-define(FIELD_TYPE_FIELD_EXTRA, 16#E1).
 -define(FIELD_TYPE_NEWDECIMAL, 16#f6).
 -define(FIELD_TYPE_ENUM, 16#f7).
 -define(FIELD_TYPE_SET, 16#f8).

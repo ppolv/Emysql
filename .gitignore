@@ -18,3 +18,8 @@ test/*.html
 test/ct_run*
 test/variables-ct*
 test/ct_default.css
+priv/*.so
+src_c/*.o
+test/ct_log_cache
+*.js
+.gitignore
