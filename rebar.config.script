@@ -1,0 +1,13 @@
+MysqlLibs = string:strip(os:cmd("mysql_config --cflags"), right, $\n),
+
+lists:keymerge(1,
+    lists:keysort(1, [
+    	{port_env, [
+			{".*", "CFLAGS", "$CFLAGS -Ic_src -Wall -g " ++ MysqlLibs}
+		]},
+		{port_specs, [
+			{"priv/emysql_parse.so", ["src_c/*.c"]}
+		]}
+	]),
+
+lists:keysort(1, CONFIG)).
